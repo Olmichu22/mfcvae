@@ -9,7 +9,7 @@ import math
 import numpy as np
 from sklearn.mixture import GaussianMixture
 
-from utils import build_fc_network, softplus_inverse, softplus_inverse_numpy, build_cnn_network
+from .utils import build_fc_network, softplus_inverse, softplus_inverse_numpy, build_cnn_network
 from typing import List
 
 

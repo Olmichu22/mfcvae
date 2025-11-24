@@ -8,9 +8,9 @@ import numpy as np
 from sklearn.mixture import GaussianMixture
 import abc
 
-from utils import softplus_inverse_numpy  #  build_fc_network, build_cnn_network, softplus_inverse,
-from conv_vlae import CONVvlaeEncoderCelebA, CONVvlaeDecoderCelebA
-from models_fc import FCsharedEncoder, FCSharedDecoder, FCseparateEncoders, FCvlaeEncoder, FCvlaeDecoder
+from .utils import softplus_inverse_numpy  #  build_fc_network, build_cnn_network, softplus_inverse,
+from .conv_vlae import CONVvlaeEncoderCelebA, CONVvlaeDecoderCelebA
+from .models_fc import FCsharedEncoder, FCSharedDecoder, FCseparateEncoders, FCvlaeEncoder, FCvlaeDecoder
 from typing import List
 
 
@@ -122,6 +122,9 @@ class MFCVAE(nn.Module):
             # TODO Fix inconsistent use of layer_dims compared to previous two encoders and decoders with in_dim
             self.encoder = FCvlaeEncoder(layer_dims=self.encode_layer_dims, in_dim=self.in_dim, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm)
             encoder_output_dims = self.encoder.encoder_output_dims  # [self.encode_layer_dims[j][-1] for j in range(self.J_n_mixtures)]
+        elif self.model_type == 'gatr':
+            self.encoder = GATrEncoder(layer_dims=self.encode_layer_dims, in_dim=self.in_dim, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm)
+            encoder_output_dims = self.encoder.encoder_output_dims
         elif self.model_type == 'conv_vlae':
             # proVLAE CelebA implementation
             self.encoder = CONVvlaeEncoderCelebA(J_n_mixtures=J_n_mixtures, in_dim=in_dim, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm)
@@ -228,9 +231,11 @@ class MFCVAE(nn.Module):
             self.decoder.alpha_dec_fade_in_list = self.alpha_dec_fade_in_list
 
         mu_q_z_j_x_list, log_sigma_square_q_z_j_x_list = self.encode(x)
-
+        # for j in range(self.J_n_mixtures):
+        #     s = torch.sqrt(torch.exp(log_sigma_square_q_z_j_x_list[j]))
+        #     print("CHECK SCALE j=", j, torch.isfinite(s).all(), s.min().item(), s.max().item())
         # case 2 in table of https://bochang.me/blog/posts/pytorch-distributions/ , shall yield e.g. 128 batch_shape, 10 event_shape.
-        q_z_j_x_list = [D.Independent(D.Normal(loc=mu_q_z_j_x_list[j], scale=torch.sqrt(torch.exp(log_sigma_square_q_z_j_x_list[j]))), 1) for j in range(self.J_n_mixtures)]  # do not permute in this case (contrary to the compute_loss_new(...) function)
+        q_z_j_x_list = [D.Independent(D.Normal(loc=mu_q_z_j_x_list[j], scale=torch.sqrt(torch.nn.functional.softplus(log_sigma_square_q_z_j_x_list[j])+1e-5)), 1) for j in range(self.J_n_mixtures)]  # do not permute in this case (contrary to the compute_loss_new(...) function)
         if self.training:
             z_sample_q_z_j_x_list = [q_z_j_x_list[j].rsample() for j in range(self.J_n_mixtures)]
         else:
@@ -344,6 +349,7 @@ class MFCVAE(nn.Module):
         for j in range(self.J_n_mixtures):
             mu_q_z_x = self.fc_mu_q_z_x_list[j](h_list[j])
             log_sigma_square_q_z_x = self.fc_log_sigma_square_q_z_x_list[j](h_list[j])
+            # log_sigma_square_q_z_x = torch.clamp(log_sigma_square_q_z_x, min=-7.0, max=7.0)
             mu_q_z_j_x_list.append(mu_q_z_x)
             log_sigma_square_q_z_j_x_list.append(log_sigma_square_q_z_x)
 
@@ -487,7 +493,7 @@ class MFCVAE(nn.Module):
         return loss, mean_log_prob_p_x_z, mean_log_prob_E_p_z_c, mean_log_prob_E_p_c, mean_log_prob_E_q_z_x, mean_log_prob_E_q_c_x, kl_z, kl_c
 
 
-    def initialize_p_z_c_params_with_gmm(self, train_loader, model_type: str, epoch: int, batch_idx: int):
+    def initialize_p_z_c_params_with_gmm(self, gatenc, train_loader, model_type: str, epoch: int, batch_idx: int):
         """
         Initialize parameters of p(z | c) with mean and variances of Gaussian Mixture model (with diagonal
         covariance matrix) trained on values sampled from q(z | x).
@@ -496,16 +502,30 @@ class MFCVAE(nn.Module):
             train_loader: data loader to loop over training data
         """
         self.eval()
+        gatenc.eval()
         data_j_list = [[] for j in range(self.J_n_mixtures)]  # stores all z_sample of all inputs from training epoch
         # loop over all examples in one epoch of training data
-        for batch_idx, (x, _) in enumerate(train_loader):
+        batch_idx = 0
+        for graph_batch in train_loader:
+
+        # for batch_idx, (x, _) in enumerate(train_loader):
+            
             if 'cuda' in self.device.type:  # always move to GPU (even if already on there)
-                x = x.to(self.device)
-            if model_type in ['fc_shared', 'fc_per_facet_enc_shared_dec', 'fc_vlae']:
-                x = x.view(x.size(0), -1).float()
-            elif model_type in ['resnet', 'convnet']:
-                x = x.float()
-            x = torch.autograd.Variable(x)
+                graph_batch = graph_batch.to(self.device)
+                
+                # x = x.to(self.device)
+            # if model_type in ['fc_shared', 'fc_per_facet_enc_shared_dec', 'fc_vlae']:
+            #     x = x.view(x.size(0), -1).float()
+            # elif model_type in ['resnet', 'convnet']:
+            #     x = x.float()
+                        # 1) Forward GATr
+            x_nodes, pos = gatenc(
+                graph_batch.pos,
+                graph_batch.feats,
+                graph_batch.extra_feats,
+                graph_batch.batch
+            )
+            x = torch.autograd.Variable(x_nodes)
             # OLD VERSION:
             # x_hat, mu_q_z_x, log_sigma_square_q_z_x, z_sample_q_z_x = self.forward(x)
             _x_hat, _q_z_j_x_list, z_sample_q_z_j_x_list = self.forward(x, epoch, batch_idx)
