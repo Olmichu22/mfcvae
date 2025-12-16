@@ -9,6 +9,7 @@ import yaml
 import argparse
 
 
+
 def cluster_acc_old(y_true, y_pred):
     """
     Compute clustering accuracy via the Kuhn-Munkres algorithm, also called the Hungarian matching algorithm.
@@ -134,6 +135,7 @@ def build_fc_network(layer_dims, activation="relu", dropout_prob=0., batch_norm=
     net = nn.Sequential(*net)  # unpacks list as separate arguments to be passed to function
 
     return net
+
 
 
 def build_cnn_network(in_channels, out_channels, transpose_conv, kernel_size, stride, output_padding=None,

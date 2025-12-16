@@ -3,29 +3,134 @@ import torch
 import torch.nn as nn
 from .utils import build_fc_network
 from typing import List
-
-
+from torch_geometric.nn import global_mean_pool, global_max_pool  # o global_max_pool
 from gatr.interface import embed_point, extract_scalar, extract_point, embed_scalar
 from gatr import GATr, SelfAttentionConfig, MLPConfig
 from xformers.ops.fmha import BlockDiagonalMask
+import torch_scatter
+
+class ActivationWithBatch(nn.Module):
+    def __init__(self, activation):
+        super().__init__()
+        self.act = activation
+    def forward(self, x, batch=None):
+        return self.act(x)
+
+class IdentityWithBatch(nn.Module):
+    def forward(self, x, batch=None):
+        return x
+    
+class SequentialWithBatch(nn.Sequential):
+    def forward(self, x, batch=None):
+        for module in self:
+            try:
+                x = module(x, batch)
+            except TypeError:
+                # el módulo no acepta batch → usar solo x
+                x = module(x)
+        return x
+
+class AttentionPool(nn.Module):
+    """Global attention pooling: softmax(aᵀ linear(x))"""
+    def __init__(self, in_dim):
+        super().__init__()
+        self.att = nn.Linear(in_dim, 1)
+
+    def forward(self, x, batch):
+        # scores por nodo
+        w = self.att(x).squeeze(-1)        # (N,)
+
+        # softmax por grafo usando scatter_softmax
+        w = torch_scatter.scatter_softmax(w, batch)  # (N,)
+
+        # sumar ponderado por grafo
+        g = torch_scatter.scatter_sum(x * w.unsqueeze(-1), batch, dim=0)
+
+        return g
 
 
-class GATr(nn.Modulde):
+class GlobalAggregator(nn.Module):
+    """
+    Global summary + aggregation back to each node.
+
+    summary_method ∈ {"mean", "max", "attn"}
+    agg_method     ∈ {"project", "concat", "none"}
+    """
+    def __init__(self, in_dim, summary_method="mean", agg_method="project"):
+        super().__init__()
+
+        # ---------- resumen global ----------
+        summary_ops = {
+            "mean": lambda x, b: global_mean_pool(x, b),
+            "max":  lambda x, b: global_max_pool(x, b),
+            "attn": AttentionPool(in_dim)
+        }
+        if summary_method not in summary_ops:
+            raise ValueError("summary_method must be mean/max/attn")
+        self.summary = summary_ops[summary_method]
+
+        # ---------- agregación ----------
+        if agg_method == "project":
+            self.op = nn.Sequential(
+                nn.Linear(in_dim, in_dim),
+                nn.ReLU(),
+                nn.Linear(in_dim, in_dim)
+            )
+            self.combine = lambda x, g: x + self.op(g)
+
+        elif agg_method == "concat":
+            self.op = nn.Sequential(
+                nn.Linear(in_dim * 2, in_dim),
+                nn.ReLU(),
+                nn.Linear(in_dim, in_dim)
+            )
+            self.combine = lambda x, g: self.op(torch.cat([x, g], dim=-1))
+
+        elif agg_method == "none":
+            self.op = IdentityWithBatch()
+            self.combine = lambda x, g: x  # identidad
+
+        else:
+            raise ValueError("agg_method must be project/concat/none")
+
+    def forward(self, x, batch):
+        # resumen global por evento (B, F)
+        if isinstance(self.summary, nn.Module):
+            g = self.summary(x, batch)
+        else:
+            g = self.summary(x, batch)
+
+        # expandimos al tamaño del batch (N, F)
+        g_expanded = g[batch]
+
+        return self.combine(x, g_expanded)
+
+
+class GATrModule(nn.Module):
     def __init__(self,
                  in_mv_channels=1,
                  out_mv_channels=1,
-                 hidden_mv_channels=16,
+                 hidden_mv_channels=32,
                  in_s_channels=2,
                  out_s_channels=16,
                  hidden_s_channels=64,
-                 num_blocks=2,
+                 num_blocks=1,
                  attention: SelfAttentionConfig = SelfAttentionConfig(),
                  mlp: MLPConfig = MLPConfig(),
                  input_dim: int = 3,
                  emb_p = None,
-                 do_bn = True):
+                 do_bn = True,
+                 dropout_prob = 0.1,
+                 agg_config = {}):
         super().__init__()
-
+        # print(num_blocks)
+        # print(in_mv_channels,
+        #       out_mv_channels,
+        #       hidden_mv_channels,
+        #         in_s_channels,
+        #         out_s_channels,
+        #         hidden_s_channels
+        #       )
         self.gatr = GATr(
             in_mv_channels=in_mv_channels,
             out_mv_channels=out_mv_channels,
@@ -36,16 +141,27 @@ class GATr(nn.Modulde):
             num_blocks=num_blocks,
             attention=attention,
             mlp=mlp,
+            # checkpoint = ["block"]
         )
 
         # BatchNorm sobre coordenadas de entrada
+        # print("CapaDropout?")
+        self.dropout = nn.Dropout(dropout_prob)
+        # print("CapaDropout?")
         
-        self.do_bn = do_bn
-        if self.do_bn:
-            self.pos_bn = nn.BatchNorm1d(input_dim, momentum=0.1)
-        else:
-            self.pos_bn = nn.Identity()
         self.emb_p = emb_p
+        self.do_bn = do_bn
+        self.agg_config = agg_config
+        if self.do_bn:
+            if self.emb_p == "dec":
+                channels = 4 + out_s_channels
+                self.pos_bn = nn.BatchNorm1d(channels, momentum=0.1)
+            else:
+                channels = 16 + out_s_channels
+                
+                self.pos_bn = nn.BatchNorm1d(channels, momentum=0.1)
+        else:
+            self.pos_bn = IdentityWithBatch()
         
         if self.emb_p:
             if self.emb_p == "enc":
@@ -60,8 +176,29 @@ class GATr(nn.Modulde):
         else:
             self.enc_x = self.extract_geom_vars
             self.dec_x = self.concat_geom_vars
-            
+        
+        self.output_dim = 0
+        if self.emb_p == "dec":
+            self.output_dim = 4 + out_s_channels
+        else:
+            self.output_dim = 16 + out_s_channels
+        
+        if self.emb_p == "dec":
+            agg_method = "none"
+        else:
+            agg_method = agg_config.get("agg", "none")    
+        self.agg = GlobalAggregator(in_dim=self.output_dim,
+                                    summary_method=agg_config.get("summary", "mean"),
+                                    agg_method=agg_method)
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.extra_repr()})"
     
+    def extra_repr(self):
+        info = self.emb_p if self.emb_p is not None else "none"
+        summary = self.agg_config.get('summary', 'mean')
+        agg = self.agg_config.get('agg', 'none')
+        return f"GA Mode={info}, summary={summary}, agg={agg}"
+            
     def extract_geom_vars(self, input):
         embedded_mv = input[:,:16]
         embedded_scalars = input[:,16:]
@@ -83,14 +220,14 @@ class GATr(nn.Modulde):
         return embedded_geom, extra_scalars
         
     def decode_x_GA(self, embedded_mv, embedded_scalars):
-        points = extract_point(embedded_mv[:, 0, :])
+        points = extract_point(embedded_mv[:, 0, :]) # (N, 3)
         # Extract scalar and aggregate outputs from point cloud
-        nodewise_outputs = extract_scalar(embedded_mv)  # (..., num_points, 1, 1)
+        nodewise_outputs = extract_scalar(embedded_mv).squeeze(dim=2)  # (..., num_points, 1, 1) (N, 1)
         x_point = points
         x_scalar = torch.cat(
-            (nodewise_outputs.view(-1, 1), embedded_scalars.view(-1, 1)), dim=1 # dim (N, F + 1)
+            (nodewise_outputs, embedded_scalars), dim=-1 
         )
-        x_dec = torch.cat([x_point, x_scalar], dim=-1) # dim (N, 3 + F + 1)
+        x_dec = torch.cat([x_point, x_scalar], dim=-1) # dim (N, 3 + 1 + s_out == dim out)
         return x_dec
         
     def build_attention_mask(self, batch):
@@ -116,8 +253,8 @@ class GATr(nn.Modulde):
         """
         # 1) normalizar coords
         
-        inputs = self.pos_bn(input_vars)                    # (N, pos_dim)
-        
+        # inputs = self.pos_bn(input_vars)                    # (N, pos_dim)
+        inputs =  input_vars
         # inputs = pos
         # 2) escalar "feats" → (N,1)
         # feats = feats.view(-1, 1)         # (N,1)
@@ -134,9 +271,51 @@ class GATr(nn.Modulde):
             embedded_geom, scalars=scalars, attention_mask=mask
         )
         x_latent = self.dec_x(embedded_mv, embedded_scalars)
+        x_latent = self.agg(x_latent, batch)
+        x_latent = self.pos_bn(x_latent)                    # (N, pos_dim)
+        x_latent = self.dropout(x_latent)
         return x_latent
     
+def build_gatr_network(layer_dims, activation, dropout_prob, batch_norm, gatr_config, emb_p="enc"):
+    net = []
+    for i in range(1, len(layer_dims)):
+        if i == 1 and emb_p=="enc":
+            gatr_config["emb_p"] = "enc"
+            gatr_config["in_s_channels"] = layer_dims[i-1] - 4 # total dims - 3 for the coords and -1 for the scalar geom feature
+            gatr_config["out_s_channels"] = layer_dims[i] - 16 # total dims -16 for mv embedding
 
+        elif i == (len(layer_dims)-1) and emb_p=="dec":
+            gatr_config["emb_p"] = "dec"
+            gatr_config["in_s_channels"] = layer_dims[i-1] - 16 # total dims -16 for mv embedding
+            gatr_config["out_s_channels"] = layer_dims[i] - 4 # total dims - 3 for the extract_point and scalar features
+
+        else:
+            gatr_config["emb_p"] = None
+            gatr_config["in_s_channels"] = layer_dims[i-1] - 16 # total dims -16 for mv embedding
+            gatr_config["out_s_channels"] = layer_dims[i] - 16 # total dims -16 for mv embedding
+            
+            
+        gatr_config["do_bn"] = batch_norm
+        gatr_config["dropout_prob"] = dropout_prob
+            
+        gatr = GATrModule(**gatr_config)
+        net.append(gatr)
+        if activation == "relu":
+            net.append(ActivationWithBatch(nn.ReLU()))
+        elif activation == 'leaky_relu':
+            net.append(ActivationWithBatch(nn.LeakyReLU()))
+            
+        elif activation == 'elu':
+            net.append(ActivationWithBatch(nn.ELU()))
+            
+        elif activation == "sigmoid":
+            net.append(ActivationWithBatch(nn.Sigmoid()))
+            
+        elif activation == "gelu":
+            net.append(ActivationWithBatch(nn.GELU()))
+            
+    net = SequentialWithBatch(*net)
+    return net
 # def build_gatr_network(layer_dims=backbone_dims, activation=activation, dropout_prob=dropout_prob, batch_norm=do_fc_batch_norm, emb_p = None):
     # emb_p puede ser enc o dec para que el modelo transforme de nuevo al espacio real o el geométrico
     
@@ -146,20 +325,26 @@ class GATrEncoder(nn.Module):
     Encoder geométrico + pasada de GATr.
     Produce x_latent (embedding fijo de entrada para TRM).
     """
-    def __init__(self, layer_dims,
+    def __init__(self, 
+                 layer_dims,
                  in_dim,
                  activation,
                  do_fc_batch_norm,
-                 gatr_config):
+                 dropout_prob = 0.,
+                 gatr_config={}):
         
         super(self.__class__, self).__init__()
+        
         self.J_n_mixtures = len(layer_dims)
         self.fc_backbone = nn.ModuleList()  # "enc"
         self.fc_rung = nn.ModuleList()  # "qladder" / "Sprosse"
         self.encoder_output_dims = []
-        self.gatr_config()
+        self.gatr_config = gatr_config
+        
+        
         # construct network
         b_lower_dim = in_dim
+        self.rung_adapter = nn.ModuleList()
         for j in range(self.J_n_mixtures):
             branch_index = layer_dims[j].index("branch")  # find branch
             # print(b_lower_dim)
@@ -172,35 +357,107 @@ class GATrEncoder(nn.Module):
             # print(rung_dims)
 
             if len(backbone_dims) == 1:  # only input dimension
-                self.fc_backbone.append(nn.Identity())
+                self.fc_backbone.append(IdentityWithBatch())
             else:
-                self.fc_backbone.append(build_gatr_network(layer_dims=backbone_dims, activation=activation, dropout_prob=dropout_prob, batch_norm=do_fc_batch_norm))
+                self.fc_backbone.append(build_gatr_network(layer_dims=backbone_dims, activation=activation, dropout_prob=dropout_prob, batch_norm=do_fc_batch_norm, gatr_config=self.gatr_config, emb_p = "enc"))
 
             if len(rung_dims) == 1:  # only input dimension
-                self.fc_rung.append(nn.Identity())
+                self.fc_rung.append(IdentityWithBatch())
             else:
-                self.fc_rung.append(build_fc_network(layer_dims=rung_dims, activation=activation, dropout_prob=dropout_prob, batch_norm=do_fc_batch_norm))
+                self.fc_rung.append(build_gatr_network(layer_dims=rung_dims, activation=activation, dropout_prob=dropout_prob, batch_norm=do_fc_batch_norm, gatr_config=self.gatr_config))
 
+            # AÑADIDO EL RUNG ADAPTER
+
+            adapter_dim = rung_dims[-1]  # puedes dejarlo igual o reducir
+            self.rung_adapter.append(
+                nn.Sequential(
+                    nn.Linear(rung_dims[-1], adapter_dim),
+                    # nn.GELU(),
+                    # nn.Linear(adapter_dim, adapter_dim)
+                )
+            )
             self.encoder_output_dims.append(rung_dims[-1])
 
 
-
-    def forward(self, x):
+    # AÑADIDO EL RUNG ADAPTER
+    def forward(self, x, batch):
         # print("forward start ---")
         rung_list = []
         b = x
         for j in range(self.J_n_mixtures):
             # print(b.size())
-            b = self.fc_backbone[j](b)
+            b = self.fc_backbone[j](b, batch)
             if self.do_progressive_training:
                 b_aux = b * self.alpha_enc_fade_in_list[j]
             else:
                 b_aux = b
-            r = self.fc_rung[j](b_aux)
+            r = self.fc_rung[j](b_aux, batch)
+            r = self.rung_adapter[j](r) 
             rung_list.append(r)
 
         return rung_list
 
+class GATrDecoder(nn.Module):
+    def __init__(self, layer_dims: List[int], z_j_dim_list: List[int], merge_type: str = 'gated_add',
+                 activation: str = "relu", dropout_prob: float = 0., do_fc_batch_norm: bool = False, gatr_config: dict = {}):
+        super(self.__class__, self).__init__()
+        self.J_n_mixtures = len(layer_dims)
+        self.z_dim_list = z_j_dim_list
+        self.merge_type = merge_type
+        self.fc_backbone = nn.ModuleList()  # "dec"
+        self.fc_rung = nn.ModuleList()  # "pladder" / "Sprosse"
+        self.gatr_config = gatr_config
+        # construct network
+        for j in range(self.J_n_mixtures):
+            if j == self.J_n_mixtures - 1:
+                # edge case: no 'merge' here
+                # whether it's rung or backbone is arbitrary here
+                rung_dims = []
+                backbone_dims = [self.z_dim_list[j]] + layer_dims[j]
+            else:
+                merge_index = layer_dims[j].index("merge")  # find branch
+                # print(merge_index)
+                # note the reversed order!
+                rung_dims = [self.z_dim_list[j]] + layer_dims[j][:merge_index]
+                if self.merge_type == 'gated_add':
+                    backbone_dims = [layer_dims[j][merge_index - 1]] + layer_dims[j][merge_index + 1:]
+                elif self.merge_type == 'cat':
+                    backbone_dims = [layer_dims[j][merge_index - 1] + layer_dims[j + 1][-1]] + layer_dims[j][merge_index + 1:]
+            # print(backbone_dims)
+            # print(rung_dims)
+            if len(rung_dims) == 1:  # only input dimension
+                self.fc_rung.append(IdentityWithBatch())
+            else:
+                self.fc_rung.append(build_gatr_network(layer_dims=rung_dims, activation=activation, dropout_prob=dropout_prob, batch_norm=do_fc_batch_norm, gatr_config=self.gatr_config))
+
+            if len(backbone_dims) == 1:  # only input dimension
+                self.fc_backbone.append(IdentityWithBatch())
+            else:
+                self.fc_backbone.append(build_gatr_network(layer_dims=backbone_dims, activation=activation, dropout_prob=dropout_prob, batch_norm=do_fc_batch_norm, gatr_config=self.gatr_config, emb_p="dec"))
+
+    
+    def merge(self, r, upper_b, merge_type='gated_add', const=0.1):
+        if merge_type == 'gated_add':
+            m = const * r + upper_b
+        elif merge_type == 'cat':
+            m = torch.cat((r, upper_b), dim=1)
+
+        return m
+
+
+    def forward(self, z_sample_q_z_j_x_list: List[torch.tensor], batch):
+        b = z_sample_q_z_j_x_list[self.J_n_mixtures - 1]
+        b = self.fc_backbone[self.J_n_mixtures - 1](b, batch)  # rung is empty here
+        for j in reversed(range(self.J_n_mixtures - 1)):  # last one already processed
+            r = self.fc_rung[j](z_sample_q_z_j_x_list[j], batch)
+            if self.do_progressive_training:
+                r_aux = r * self.alpha_dec_fade_in_list[j]
+            else:
+                r_aux = r
+            b = self.merge(r_aux, b, merge_type=self.merge_type)
+            b = self.fc_backbone[j](b, batch)
+
+        return b
   
 
 

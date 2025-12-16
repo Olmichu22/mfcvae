@@ -7,7 +7,8 @@ import math
 import numpy as np
 from sklearn.mixture import GaussianMixture
 import abc
-
+from mfcvae.models_fc import GATrDecoder, GATrEncoder
+from tqdm import tqdm
 from .utils import softplus_inverse_numpy  #  build_fc_network, build_cnn_network, softplus_inverse,
 from .conv_vlae import CONVvlaeEncoderCelebA, CONVvlaeDecoderCelebA
 from .models_fc import FCsharedEncoder, FCSharedDecoder, FCseparateEncoders, FCvlaeEncoder, FCvlaeDecoder
@@ -24,7 +25,7 @@ class MFCVAE(nn.Module):
                  fix_pi_p_c: bool = False, facet_to_fix_pi_p_c: str = "all",
                  n_batches_fade_in: int = 15000, gamma_kl_z_pretrain: float = 0.0, gamma_kl_c_pretrain: float = 0.0,
                  do_progressive_training: bool = True, fixed_var_init: float = 0.01,
-                 activation: str = 'relu', do_fc_batch_norm: bool = False):
+                 activation: str = 'relu', do_fc_batch_norm: bool = False, gatr_config: dict = {}):
         """
         Initialize MFCVAE model.
 
@@ -82,6 +83,7 @@ class MFCVAE(nn.Module):
         self.fixed_var_init = fixed_var_init
         self.activation = activation
         self.do_fc_batch_norm = do_fc_batch_norm
+        self.gatr_config = gatr_config
 
         # parameters
         self._pi_p_c_j_list = torch.nn.ParameterList()
@@ -123,7 +125,7 @@ class MFCVAE(nn.Module):
             self.encoder = FCvlaeEncoder(layer_dims=self.encode_layer_dims, in_dim=self.in_dim, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm)
             encoder_output_dims = self.encoder.encoder_output_dims  # [self.encode_layer_dims[j][-1] for j in range(self.J_n_mixtures)]
         elif self.model_type == 'gatr':
-            self.encoder = GATrEncoder(layer_dims=self.encode_layer_dims, in_dim=self.in_dim, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm)
+            self.encoder = GATrEncoder(layer_dims=self.encode_layer_dims, in_dim=self.in_dim, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm, gatr_config=self.gatr_config)
             encoder_output_dims = self.encoder.encoder_output_dims
         elif self.model_type == 'conv_vlae':
             # proVLAE CelebA implementation
@@ -142,6 +144,9 @@ class MFCVAE(nn.Module):
         elif self.model_type == 'fc_vlae':
             # TODO Fix inconsistent use of layer_dims compared to previous two encoders and decoders with in_dim
             self.decoder = FCvlaeDecoder(layer_dims=self.decode_layer_dims, z_j_dim_list=self.z_j_dim_list, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm)
+        elif self.model_type == 'gatr':
+            # TODO Fix inconsistent use of layer_dims compared to previous two encoders and decoders with in_dim
+            self.decoder = GATrDecoder(layer_dims=self.decode_layer_dims, z_j_dim_list=self.z_j_dim_list, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm, gatr_config=self.gatr_config)
         elif self.model_type == 'conv_vlae':
             # proVLAE CelebA implementation
             self.decoder = CONVvlaeDecoderCelebA(J_n_mixtures=J_n_mixtures, in_dim=in_dim, z_j_dim_list=self.z_j_dim_list, activation=self.activation, do_fc_batch_norm=self.do_fc_batch_norm)
@@ -149,6 +154,9 @@ class MFCVAE(nn.Module):
             self.layer_x_hat_z = nn.Linear(decode_layer_dims[-1], in_dim)  # fully-connected layer from decoder layers to x_hat
         elif self.model_type == 'fc_vlae':
             self.layer_x_hat_z = nn.Linear(decode_layer_dims[0][-1], in_dim)  # last output of backbone in facet 0
+        elif self.model_type == "gatr":
+            self.layer_x_hat_z = nn.Linear(decode_layer_dims[0][-1], in_dim)  # last output of backbone in facet 0
+            
         elif self.model_type == 'conv_vlae':
             self.layer_x_hat_z = nn.Identity()  # last layer in decoder is already in_dim shape
 
@@ -204,7 +212,7 @@ class MFCVAE(nn.Module):
 
 
 
-    def forward(self, x: torch.tensor, epoch: int, batch_idx: int):
+    def forward(self, x: torch.tensor, epoch: int, batch_idx: int, batch = None):
         """
         Pass x through the MFCVAE network (x -> x_hat).
         Passes x through the encoder, samples from all q(z_j | x) and passes all z_sample through the decoder to obtain reconstructed x.
@@ -230,7 +238,11 @@ class MFCVAE(nn.Module):
             self.encoder.alpha_enc_fade_in_list = self.alpha_enc_fade_in_list
             self.decoder.alpha_dec_fade_in_list = self.alpha_dec_fade_in_list
 
-        mu_q_z_j_x_list, log_sigma_square_q_z_j_x_list = self.encode(x)
+        if batch is not None:
+            mu_q_z_j_x_list, log_sigma_square_q_z_j_x_list = self.encode(x, batch)
+        else:
+            mu_q_z_j_x_list, log_sigma_square_q_z_j_x_list = self.encode(x)
+            
         # for j in range(self.J_n_mixtures):
         #     s = torch.sqrt(torch.exp(log_sigma_square_q_z_j_x_list[j]))
         #     print("CHECK SCALE j=", j, torch.isfinite(s).all(), s.min().item(), s.max().item())
@@ -241,7 +253,11 @@ class MFCVAE(nn.Module):
         else:
             z_sample_q_z_j_x_list = [mu_q_z_j_x_list[j] for j in range(self.J_n_mixtures)]
 
-        x_hat = self.decode(z_sample_q_z_j_x_list)
+        if batch is not None:
+            x_hat = self.decode(z_sample_q_z_j_x_list, batch)
+        else:
+            x_hat = self.decode(z_sample_q_z_j_x_list)
+            
 
         return x_hat, q_z_j_x_list, z_sample_q_z_j_x_list
 
@@ -331,7 +347,7 @@ class MFCVAE(nn.Module):
         return alpha_enc_fade_in_list, alpha_dec_fade_in_list, gamma_kl_z_list, gamma_kl_c_list
 
 
-    def encode(self, x: torch.tensor):
+    def encode(self, x: torch.tensor, batch = None):
         """
         Estimate parameters of q(z_j | x), and sample from these distribution.
 
@@ -341,7 +357,11 @@ class MFCVAE(nn.Module):
         Returns:
             mu and log(variance) of q(z_j | x) (as list), each tensor of dimension (self.z_dim).
         """
-        h_list = self.encoder(x)
+        if batch is not None:
+            h_list = self.encoder(x, batch)
+        else:
+            h_list = self.encoder(x)
+            
         if self.do_progressive_training and self.model_type == 'fc_per_facet_enc_shared_dec':
             h_list = [h * self.alpha_enc_fade_in_list[idx] for idx, h in enumerate(h_list)]
 
@@ -356,7 +376,7 @@ class MFCVAE(nn.Module):
         return mu_q_z_j_x_list, log_sigma_square_q_z_j_x_list
 
 
-    def decode(self, z_sample_q_z_j_x_list: torch.tensor):
+    def decode(self, z_sample_q_z_j_x_list: torch.tensor, batch = None):
         """
         Estimate the parameters of p(x | z).
 
@@ -370,7 +390,10 @@ class MFCVAE(nn.Module):
         if self.do_progressive_training and self.model_type == 'fc_per_facet_enc_shared_dec':
             z_sample_q_z_j_x_list = [z_sample_q_z_j_x_list[j] * self.alpha_dec_fade_in_list[j] for j in range(self.J_n_mixtures)]
 
-        h = self.decoder(z_sample_q_z_j_x_list)
+        if batch is not None:
+            h = self.decoder(z_sample_q_z_j_x_list, batch)
+        else:
+            h = self.decoder(z_sample_q_z_j_x_list)
         x_hat = self.layer_x_hat_z(h)
         if self.act_x_hat_z is not None:
             x_hat = self.act_x_hat_z(x_hat)
@@ -493,7 +516,7 @@ class MFCVAE(nn.Module):
         return loss, mean_log_prob_p_x_z, mean_log_prob_E_p_z_c, mean_log_prob_E_p_c, mean_log_prob_E_q_z_x, mean_log_prob_E_q_c_x, kl_z, kl_c
 
 
-    def initialize_p_z_c_params_with_gmm(self, gatenc, train_loader, model_type: str, epoch: int, batch_idx: int):
+    def initialize_p_z_c_params_with_gmm(self, train_loader, model_type: str, epoch: int, batch_idx: int):
         """
         Initialize parameters of p(z | c) with mean and variances of Gaussian Mixture model (with diagonal
         covariance matrix) trained on values sampled from q(z | x).
@@ -502,33 +525,29 @@ class MFCVAE(nn.Module):
             train_loader: data loader to loop over training data
         """
         self.eval()
-        gatenc.eval()
         data_j_list = [[] for j in range(self.J_n_mixtures)]  # stores all z_sample of all inputs from training epoch
+        SUBSAMPLE_RATE = 0.25   # usar solo el 25%
         # loop over all examples in one epoch of training data
-        batch_idx = 0
-        for graph_batch in train_loader:
-
-        # for batch_idx, (x, _) in enumerate(train_loader):
-            
+        for batch_idx, x in tqdm(enumerate(train_loader)):
+            # --- SUBSAMPLING: saltar el 75% de batches ---
+            if np.random.rand() > SUBSAMPLE_RATE:
+                continue
             if 'cuda' in self.device.type:  # always move to GPU (even if already on there)
-                graph_batch = graph_batch.to(self.device)
-                
-                # x = x.to(self.device)
-            # if model_type in ['fc_shared', 'fc_per_facet_enc_shared_dec', 'fc_vlae']:
-            #     x = x.view(x.size(0), -1).float()
-            # elif model_type in ['resnet', 'convnet']:
-            #     x = x.float()
-                        # 1) Forward GATr
-            x_nodes, pos = gatenc(
-                graph_batch.pos,
-                graph_batch.feats,
-                graph_batch.extra_feats,
-                graph_batch.batch
-            )
-            x = torch.autograd.Variable(x_nodes)
+                x = x.to(self.device)
+            if model_type in ['fc_shared', 'fc_per_facet_enc_shared_dec', 'fc_vlae']:
+                x = x.view(x.size(0), -1).float()
+            elif model_type in ['resnet', 'convnet']:
+                x = x.float()
+            if model_type == "gatr":
+                input_data = torch.cat([x.pos, x.feats, x.extra_feats], dim=-1)
+                batch = x.batch
+                x = input_data
+            else:
+                batch = None
+            x = torch.autograd.Variable(x)
             # OLD VERSION:
             # x_hat, mu_q_z_x, log_sigma_square_q_z_x, z_sample_q_z_x = self.forward(x)
-            _x_hat, _q_z_j_x_list, z_sample_q_z_j_x_list = self.forward(x, epoch, batch_idx)
+            _x_hat, _q_z_j_x_list, z_sample_q_z_j_x_list = self.forward(x, epoch, batch_idx, batch)
             for j in range(self.J_n_mixtures):
                 data_j_list[j].append(z_sample_q_z_j_x_list[j].data.cpu().numpy())
         for j in range(self.J_n_mixtures):
@@ -536,7 +555,8 @@ class MFCVAE(nn.Module):
 
         if self.cov_type_p_z_c == 'diag':
             gmm_j_list = []
-            for j in range(self.J_n_mixtures):
+            print("Calculating GMM...")
+            for j in tqdm(range(self.J_n_mixtures)):
                 gmm_j = GaussianMixture(n_components=self.n_clusters_j_list[j], covariance_type='diag')  # diagonal covariance matrix (also in the case of having a full coviance matrix for p_z_c)
                 gmm_j.fit(data_j_list[j])
                 gmm_j_list.append(gmm_j)
